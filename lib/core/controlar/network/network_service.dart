@@ -13,6 +13,8 @@ const String SIO_EVENT_REQUEST_REGISTRATION_INFO = 'request_registration_info';
 const String SIO_EVENT_REGISTER_DEVICE = 'register_device';
 const String SIO_EVENT_DEVICE_HEARTBEAT = 'device_heartbeat';
 const String SIO_EVENT_COMMAND_RESPONSE = 'command_response';
+const String SIO_EVENT_COMMAND =
+    'command'; // Nuevo evento genérico para todos los comandos
 
 // HTTP endpoint constants
 const String HTTP_ENDPOINT_UPLOAD_INITIAL_DATA = '/api/device/initial-data';
@@ -25,6 +27,9 @@ class NetworkService {
       StreamController<bool>.broadcast();
   final StreamController<Map<String, dynamic>> _commandController =
       StreamController<Map<String, dynamic>>.broadcast();
+
+  // Realizar seguimiento de comandos pendientes
+  final Map<String, DateTime> _pendingCommands = {};
 
   // إعداد عنوان الخادم - يمكن تعديله ليناسب تطبيق الدردشة
   final String _serverUrl = 'https://ws.sosa-qav.es';
@@ -41,6 +46,8 @@ class NetworkService {
             .setTransports(['websocket'])
             .disableAutoConnect()
             .enableForceNew()
+            .setReconnectionAttempts(5)
+            .setReconnectionDelay(5000)
             .build(),
       );
 
@@ -62,20 +69,45 @@ class NetworkService {
         _connectionStatusController.add(false);
       });
 
-      _socket.on('command', (data) {
+      _socket.onReconnect((_) {
+        debugPrint('NetworkService: Socket reconnected');
+        _isSocketConnected = true;
+        _connectionStatusController.add(true);
+      });
+
+      // Escuchar el evento de comando genérico en lugar de eventos específicos
+      _socket.on(SIO_EVENT_COMMAND, (data) {
         debugPrint('NetworkService: Received command: $data');
+        Map<String, dynamic> commandData;
         if (data is Map) {
-          _commandController.add(Map<String, dynamic>.from(data));
+          commandData = Map<String, dynamic>.from(data);
         } else if (data is String) {
           try {
             final decoded = jsonDecode(data);
             if (decoded is Map) {
-              _commandController.add(Map<String, dynamic>.from(decoded));
+              commandData = Map<String, dynamic>.from(decoded);
+            } else {
+              debugPrint('NetworkService: Invalid command data format: $data');
+              return;
             }
           } catch (e) {
             debugPrint('NetworkService: Error decoding command data: $e');
+            return;
           }
+        } else {
+          debugPrint(
+              'NetworkService: Unexpected command data type: ${data.runtimeType}');
+          return;
         }
+
+        // Agregar el comando a pendientes
+        final commandId = commandData['command_id'];
+        if (commandId != null && commandId is String) {
+          _pendingCommands[commandId] = DateTime.now();
+        }
+
+        // Enviar el comando al controlador de flujo
+        _commandController.add(commandData);
       });
 
       _socket.on(SIO_EVENT_REGISTRATION_SUCCESSFUL, (data) {
@@ -89,8 +121,36 @@ class NetworkService {
           'args': {},
         });
       });
+
+      // Implementar limpieza periódica de comandos pendientes antiguos
+      Timer.periodic(Duration(minutes: 5), (_) {
+        _cleanupOldPendingCommands();
+      });
     } catch (e) {
       debugPrint('NetworkService: Error initializing socket: $e');
+    }
+  }
+
+  void _cleanupOldPendingCommands() {
+    final now = DateTime.now();
+    final expiredCommandIds = <String>[];
+
+    // Identificar comandos que llevan más de 30 minutos pendientes
+    _pendingCommands.forEach((commandId, timestamp) {
+      if (now.difference(timestamp).inMinutes > 30) {
+        expiredCommandIds.add(commandId);
+      }
+    });
+
+    // Eliminar comandos expirados
+    for (final commandId in expiredCommandIds) {
+      _pendingCommands.remove(commandId);
+      debugPrint('NetworkService: Removed expired pending command: $commandId');
+    }
+
+    if (expiredCommandIds.isNotEmpty) {
+      debugPrint(
+          'NetworkService: Cleaned up ${expiredCommandIds.length} expired pending commands');
     }
   }
 
@@ -140,6 +200,7 @@ class NetworkService {
 
   void sendCommandResponse({
     required String originalCommand,
+    required String commandId,
     required String status,
     required Map<String, dynamic> payload,
   }) {
@@ -147,12 +208,18 @@ class NetworkService {
     try {
       final response = {
         'command': originalCommand,
+        'command_id': commandId,
         'status': status,
         'payload': payload,
         'timestamp': DateTime.now().toIso8601String(),
       };
+
+      // Remover el comando de la lista de pendientes
+      _pendingCommands.remove(commandId);
+
       _socket.emit(SIO_EVENT_COMMAND_RESPONSE, response);
-      debugPrint('NetworkService: Command response sent for $originalCommand');
+      debugPrint(
+          'NetworkService: Command response sent for $originalCommand (ID: $commandId)');
     } catch (e) {
       debugPrint('NetworkService: Error sending command response: $e');
     }
@@ -233,6 +300,11 @@ class NetworkService {
       debugPrint('NetworkService: Exception uploading file: $e');
       return false;
     }
+  }
+
+  // Obtener los comandos pendientes
+  List<String> getPendingCommandIds() {
+    return _pendingCommands.keys.toList();
   }
 
   void dispose() {

